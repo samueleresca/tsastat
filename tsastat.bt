@@ -1,0 +1,128 @@
+#!/usr/bin/env bpftrace
+
+#include <linux/sched.h>
+
+// The futex states as defined in uapi/linux/futex.h
+#define FUTEX_WAIT		0
+#define FUTEX_WAIT_BITSET	9
+#define FUTEX_PRIVATE_FLAG	128
+#define FUTEX_WAIT_PRIVATE	(FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
+#define FUTEX_WAIT_BITSET_PRIVATE	(FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)
+
+// Prevent to print the maps on exit
+config = {
+  print_maps_on_exit=0
+}
+
+BEGIN
+{
+  printf("Tracing scheduler events... Hit Ctrl-C to end.\n");
+}
+
+
+// CPU time tracking tracking
+tracepoint:sched:sched_switch
+{
+  $prev_pid = args->prev_pid;
+  $next_pid = args->next_pid;
+  $prev_state = args->prev_state;
+
+  // Record on-CPU time for previous task
+  if (has_key(@start, $prev_pid))
+  {
+    @cpu[comm, $prev_pid] = sum(nsecs - @start[$prev_pid]);
+  }
+
+  // Start timing for next thread
+  @start[$next_pid] = nsecs;
+
+  // Calculate run queue time when thread gets scheduled
+  if (has_key(@wakeup_ts, $next_pid))
+  {
+    @runq[comm, $next_pid] = sum(nsecs - @wakeup_ts[$next_pid]);
+    delete(@wakeup_ts, $next_pid);
+  }
+
+  // Store sleep state for previous task
+  // in case it is not TASK_RUNNING
+  if ($prev_state > 0)
+  {
+    @sleeping_ts[$prev_pid] = nsecs;
+    @sleeping_state[$prev_pid] = $prev_state;
+  }
+}
+
+tracepoint:sched:sched_wakeup,
+tracepoint:sched:sched_wakeup_new
+{
+  // Track wakeup time
+  @wakeup_ts[tid] = nsecs;
+
+  // If thread was sleeping, record sleep time
+  if (has_key(@sleeping_state, tid))
+  {
+    $state = @sleeping_state[tid];
+    $delta = nsecs - @sleeping_ts[tid];
+
+    // Categorize based on linux thread state
+    if ($state & TASK_UNINTERRUPTIBLE)
+    {
+      @usl[comm, tid] = sum($delta);
+    }
+    else if ($state & TASK_INTERRUPTIBLE) 
+    {
+      @slp[comm, tid] = sum($delta);
+    }
+    else if ($state & TASK_STOPPED)
+    {
+      @sus[comm, tid] = sum($delta);
+    } 
+    else if ($state & TASK_DEAD)
+    {
+      @dea[comm, tid] = sum($delta);
+    } 
+ 
+    delete(@sleeping_ts, tid);
+    delete(@sleeping_state, tid);
+  }
+}
+
+// Track futex wait operations (lock attempts)
+tracepoint:syscalls:sys_enter_futex
+/args->op == FUTEX_WAIT || args->op == FUTEX_WAIT_BITSET || args->op == FUTEX_WAIT_PRIVATE || args->op == FUTEX_WAIT_BITSET_PRIVATE /
+{
+  @lock_ts[tid] = nsecs;
+}
+
+// Track futex wake operations (lock release)
+tracepoint:syscalls:sys_exit_futex
+/has_key(@lock_ts, tid)/
+{
+    @lck[comm, tid] = sum(nsecs - @lock_ts[tid]);
+    delete(@lock_ts, tid);
+}
+
+END
+{
+  printf("\nThread state analysis:\n");
+  printf("%-16s %-6s %6s %6s %6s %6s %6s %6s %6s \n", "COMM", "PID", "CPU", "RUNQ", "SLP", "USL", "SUS", "LCK", "DEA");
+
+  // Convert nanoseconds to milliseconds
+  $ms = (uint64) 1000000;
+
+  for ($kv : @cpu)
+  {
+    $comm = $kv.0.0;
+    $pid = $kv.0.1;
+
+    $cpu_ms = @cpu[$comm, $pid] / $ms;
+    $runq_ms = @runq[$comm, $pid] / $ms;
+    $slp_ms = @slp[$comm, $pid] / $ms;
+    $usl_ms = @usl[$comm, $pid] / $ms;
+    $sus_ms = @sus[$comm, $pid] / $ms;
+    $lck_ms = @lck[$comm, $pid] / $ms;
+    $dea_ms = @dea[$comm, $pid] / $ms;
+
+    printf("%-16s %-6d %6d %6d %6d %6d %6d %6d %6d\n", $comm, $pid, $cpu_ms, $runq_ms, $slp_ms, $usl_ms, $sus_ms, $lck_ms, $dea_ms);
+  }
+}
